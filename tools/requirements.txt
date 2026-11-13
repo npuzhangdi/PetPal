@@ -1,0 +1,2 @@
+# QtCore / QtGui / QtWidgets / QtNetwork only; no unused Addons bundle.
+PySide6-Essentials==6.11.2
