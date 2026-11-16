@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import os
 import re
+import time
 import uuid
 from ctypes import wintypes
 from pathlib import Path
@@ -133,8 +134,8 @@ def _create_labeled_file(path: Path, content: bytes, level=MEDIUM):
         kernel.CloseHandle(handle)
 
 
-def prepare_desktop_executable(path: Path, root: Path):
-    """Replace only a generated low-labeled EXE with an identical desktop file.
+def prepare_desktop_executable(path: Path, root: Path, *, source: Path | None = None):
+    """Prepare a generated EXE or publish a new build at desktop integrity.
 
     Never relabel an existing file, edit its DACL, or modify folder permissions.
     This operation requires an already ordinary desktop installation process.
@@ -147,12 +148,12 @@ def prepare_desktop_executable(path: Path, root: Path):
     scripts = root / ".venv" / "Scripts"
     allowed = {root / "PetPal.exe", root / "uninstall.exe",
                scripts / "PetPal.exe", scripts / "python.exe", scripts / "pythonw.exe"}
-    if path not in allowed or not path.is_file():
+    if path not in allowed or (source is None and not path.is_file()):
         raise ValueError("非法桌面启动项路径：" + str(path))
     require_desktop_installer()
-    if file_integrity(path) >= MEDIUM:
+    if source is None and file_integrity(path) >= MEDIUM:
         return
-    content = path.read_bytes()
+    content = (source if source is not None else path).read_bytes()
     if not content.startswith(b"MZ"):
         raise ValueError("启动项不是有效的 Windows exe：" + str(path))
     pending = path.with_name(path.name + ".desktop-" + uuid.uuid4().hex + ".tmp")
@@ -160,7 +161,14 @@ def prepare_desktop_executable(path: Path, root: Path):
         _create_labeled_file(pending, content)
         if file_integrity(pending) < MEDIUM or pending.read_bytes() != content:
             raise OSError("新启动项的完整性或内容校验失败")
-        os.replace(pending, path)
+        for attempt in range(10):
+            try:
+                os.replace(pending, path)
+                break
+            except OSError as exc:
+                if attempt == 9 or getattr(exc, "winerror", None) not in (5, 32, 33):
+                    raise
+                time.sleep(0.15)
         if file_integrity(path) < MEDIUM:
             raise OSError("启动项替换后的完整性校验失败")
     except OSError as exc:

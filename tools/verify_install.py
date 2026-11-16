@@ -6,12 +6,15 @@ import sys
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from tools.windows_integrity import MEDIUM, file_integrity
 
 
 def verify():
     for filename in ("PetPal.exe", "uninstall.exe"):
         target = ROOT / filename
         assert target.is_file() and target.stat().st_size < 1_000_000, filename
+        if file_integrity(target) < MEDIUM:
+            raise RuntimeError(f"{filename} 仍带有 Windows 低完整性标记，请从资源管理器重新运行 first_run.bat。")
     environment = os.environ.copy()
     environment["QT_QPA_PLATFORM"] = "offscreen"
     environment["PYTHONDONTWRITEBYTECODE"] = "1"

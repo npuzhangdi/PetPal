@@ -1,6 +1,7 @@
 """Four independent pets with autonomous walking, feeding, ball play and sleep.
 
-Animation runs at 160 ms, life decisions at 1 s. Hidden pets suspend both timers.
+Motion runs at 33 ms, sprite changes at 160 ms and life decisions at 1 s.
+Hidden pets suspend both timers.
 Actions and outfits are available from the tray settings and the pet context menu.
 """
 
@@ -46,7 +47,8 @@ def _pet_dir() -> Path:
 class DesktopPet(QWidget):
     """有生活状态的桌面宠物。"""
 
-    _ANIM_MS = 160          # 走路帧切换
+    _ANIM_MS = 33
+    _FRAME_MS = 160
     _STATE_MS = 1000      # 状态机 tick（每秒检查状态，动画定时器独立处理走动）
     _SPEECH_MS = 5000      # 气泡停留
 
@@ -72,6 +74,10 @@ class DesktopPet(QWidget):
         self._game_tick = 0
         self._facing = 1
         self._bob_phase = 0.0
+        self._frame_elapsed = 0
+        self._last_anim_ms = 0
+        self._wander_pos = QPointF()
+        self._wander_enabled = settings.pet_wander
         self._wander_target = QPoint(0, 0)
         self._state_until = 0          # 毫秒时间戳，状态结束时间
         self._last_activity_ms = self._now_ms()
@@ -85,12 +91,10 @@ class DesktopPet(QWidget):
         self._anim_timer = QTimer(self)
         self._anim_timer.setInterval(self._ANIM_MS)
         self._anim_timer.timeout.connect(self._tick_anim)
-        self._anim_timer.start()
 
         self._state_timer = QTimer(self)
         self._state_timer.setInterval(self._STATE_MS)
         self._state_timer.timeout.connect(self._tick_state)
-        self._state_timer.start()
 
         # 默认位置
         self._move_to_den()
@@ -124,35 +128,52 @@ class DesktopPet(QWidget):
         if self._sleeping.isNull():
             self._sleeping = self._standing
         self._pet_type = pet_type
-        size = int(self.settings.pet_size)
-        self.setFixedSize(size, size + 30)  # 多 30px 给窝/气泡
+        self._resize_sprites()
         self._frame_index = 0
         self._bubble = None
 
+    def _resize_sprites(self) -> None:
+        size = self.settings.pet_size
+        self.setFixedSize(size, size + 30)
+        body = size - 4
+        self._sprites = {
+            pm.cacheKey(): pm.scaled(body, body, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            for pm in (*self._frames, self._standing, self._sleeping) if not pm.isNull()
+        }
+
+    def apply_settings(self) -> None:
+        if self.settings.pet_type != self._pet_type:
+            self._load_pet(self.settings.pet_type)
+            self._move_to_den()
+        elif self.settings.pet_size != self.width():
+            self._resize_sprites()
+        if self._wander_enabled and not self.settings.pet_wander and self._state == S_WANDER:
+            self._enter_idle(self._now_ms())
+        self._wander_enabled = self.settings.pet_wander
+        self._wander_action.setChecked(self._wander_enabled)
+        self._clothing = self.settings.get("pet_clothing")
+        self._mood = self.settings.get("pet_mood")
+        self.update()
+
     def set_pet_type(self, pet_type: str) -> None:
         self.settings.set("pet_type", pet_type)
-        self._load_pet(pet_type)
-        self._move_to_den()
+        self.apply_settings()
 
     def set_pet_size(self, size: int) -> None:
         self.settings.set("pet_size", size)
-        self._load_pet(self._pet_type)
+        self.apply_settings()
 
     def set_wander(self, enabled: bool) -> None:
         self.settings.set("pet_wander", enabled)
-        if not enabled:
-            self._state = S_IDLE
-            self._move_to_den()
+        self.apply_settings()
 
     def set_clothing(self, clothing: str) -> None:
         self.settings.set("pet_clothing", clothing)
-        self._clothing = clothing
-        self.update()
+        self.apply_settings()
 
     def set_mood(self, mood: str) -> None:
         self.settings.set("pet_mood", mood)
-        self._mood = mood
-        self.update()
+        self.apply_settings()
 
     def _is_wander_enabled(self) -> bool:
         return bool(self.settings.pet_wander) and not self._privacy_mode
@@ -266,40 +287,45 @@ class DesktopPet(QWidget):
         self._bubble = None
         self.update()
 
-    def _step_toward(self, target: QPoint) -> None:
-        cur = self.pos()
-        dx = target.x() - cur.x()
-        dy = target.y() - cur.y()
+    def _step_toward(self, target: QPoint, elapsed: int) -> None:
+        if self.pos() != self._wander_pos.toPoint():
+            self._wander_pos = QPointF(self.pos())
+        dx = target.x() - self._wander_pos.x()
+        dy = target.y() - self._wander_pos.y()
         dist = math.hypot(dx, dy)
         if dist < 10:
+            self._enter_idle(self._now_ms())
             return
-        step = 6  # 慢走（原来是 12，太快显得频繁）
-        nx = cur.x() + int(dx / dist * step)
-        ny = cur.y() + int(dy / dist * step)
+        step = 6 * elapsed / self._FRAME_MS
         self._facing = 1 if dx >= 0 else -1
-        self.move(nx, ny)
-        self.update()
+        self._wander_pos += QPointF(dx / dist * step, dy / dist * step)
+        self.move(self._wander_pos.toPoint())
 
     # ------------------------------------------------------------------
     # 动画
     # ------------------------------------------------------------------
     def _tick_anim(self) -> None:
-        # 走路帧 vs 站立帧 vs 睡觉帧
+        now = self._now_ms()
+        elapsed = min(now - self._last_anim_ms, self._anim_timer.interval() + 50)
+        self._last_anim_ms = now
+        self._frame_elapsed += elapsed
+        frames, self._frame_elapsed = divmod(self._frame_elapsed, self._FRAME_MS)
         if self._state == S_WANDER and self._drag_pos is None:
-            self._step_toward(self._wander_target)
-            if (self.pos() - self._wander_target).manhattanLength() < 12:
-                self._enter_idle(self._now_ms())
-            self._frame_index = (self._frame_index + 1) % 4
-        elif self._state == S_SLEEP:
-            self._frame_index = 0
+            self._step_toward(self._wander_target, elapsed)
+            self._frame_index = (self._frame_index + frames) % len(self._frames)
         else:
             self._frame_index = 0
-        if self._bubble and self._now_ms() > self._bubble_until:
+        if self._bubble and now > self._bubble_until:
             self._bubble = None
-        self._game_tick += 1
-        # 轻微浮动
-        self._bob_phase += 0.1
-        self.update()
+            self.update()
+        self._game_tick += frames
+        self._bob_phase += 0.1 * elapsed / self._FRAME_MS
+        moving = self._state in (S_WANDER, S_PLAY) or self._mood == "party"
+        interval = self._ANIM_MS if moving else self._FRAME_MS
+        if self._anim_timer.isActive() and self._anim_timer.interval() != interval:
+            self._anim_timer.setInterval(interval)
+        if frames or moving:
+            self.update()
 
     # ------------------------------------------------------------------
     # 说话
@@ -337,14 +363,17 @@ class DesktopPet(QWidget):
             pm = self._frames[self._frame_index]
         else:
             pm = self._standing
-        if not pm.isNull():
-            scaled = pm.scaled(body_size, body_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        scaled = self._sprites.get(pm.cacheKey())
+        if scaled is not None:
+            x = (w - scaled.width()) // 2
+            y = int((h - scaled.height()) / 2 + bob_y - 14)
+            p.save()
             if self._facing == -1:
-                from PySide6.QtGui import QTransform
-                t = QTransform()
-                t.scale(-1, 1)
-                scaled = scaled.transformed(t)
-            p.drawPixmap(int((w - scaled.width()) / 2), int((h - scaled.height()) / 2 + bob_y - 14), scaled)
+                p.translate(w, 0)
+                p.scale(-1, 1)
+                x = w - x - scaled.width()
+            p.drawPixmap(x, y, scaled)
+            p.restore()
 
         # Compact status labels stay inside even the smallest pet window.
         if self._state == S_SLEEP:
@@ -545,7 +574,7 @@ class DesktopPet(QWidget):
     # 右键菜单
     # ------------------------------------------------------------------
     def _build_context_menu(self) -> None:
-        self._ctx_menu = QMenu()
+        self._ctx_menu = QMenu(self)
         sub = QMenu("切换动物", self._ctx_menu)
         for t in _PET_TYPES:
             act = QAction(f"{_PET_NAMES[t]} ({t})", sub)
@@ -553,11 +582,11 @@ class DesktopPet(QWidget):
             sub.addAction(act)
         self._ctx_menu.addMenu(sub)
 
-        act_wander = QAction("自动巡视", self._ctx_menu)
-        act_wander.setCheckable(True)
-        act_wander.setChecked(self.settings.pet_wander)
-        act_wander.toggled.connect(self._on_wander_toggled)
-        self._ctx_menu.addAction(act_wander)
+        self._wander_action = QAction("自动巡视", self._ctx_menu)
+        self._wander_action.setCheckable(True)
+        self._wander_action.setChecked(self.settings.pet_wander)
+        self._wander_action.triggered.connect(self._on_wander_toggled)
+        self._ctx_menu.addAction(self._wander_action)
 
         sub_size = QMenu("宠物大小", self._ctx_menu)
         for s in (96, 128, 160, 200, 240):
@@ -614,6 +643,7 @@ class DesktopPet(QWidget):
         super().hideEvent(event)
 
     def showEvent(self, event):
+        self._last_anim_ms = self._now_ms()
         self._anim_timer.start()
         self._state_timer.start()
         super().showEvent(event)
@@ -622,11 +652,6 @@ class DesktopPet(QWidget):
     def closeEvent(self, event) -> None:
         self._anim_timer.stop()
         self._state_timer.stop()
-        # 等待后台线程结束
-        for attr in ("_anim_timer", "_state_timer"):
-            t = getattr(self, attr, None)
-            if t:
-                t.stop()
         super().closeEvent(event)
 
     def wait_threads(self) -> None:

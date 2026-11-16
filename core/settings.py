@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULTS = {
     "pet_type": "cat", "pet_size": 160, "pet_wander": True,
-    "pet_visible": True, "pet_clothing": "none", "pet_mood": "happy",
+    "pet_enabled": False, "pet_visible": True, "pet_clothing": "none", "pet_mood": "happy",
     "ui_theme": "dark", "privacy_bg_type": "color",
     "privacy_color": "#101827", "privacy_image": "",
     "password_protect_quit": True,
@@ -61,7 +61,7 @@ class SettingsManager:
             self._data["pet_size"] = max(80, min(260, int(self._data["pet_size"])))
         except (ValueError, TypeError):
             self._data["pet_size"] = 160
-        for key in ("pet_visible", "pet_wander", "password_protect_quit"):
+        for key in ("pet_enabled", "pet_visible", "pet_wander", "password_protect_quit"):
             if not isinstance(self._data.get(key), bool):
                 self._data[key] = DEFAULTS[key]
         color = self._data.get("privacy_color")
@@ -86,7 +86,8 @@ class SettingsManager:
         try:
             self._data.update(values)
             self._validate()
-            self._save()
+            if self._data != previous:
+                self._save()
         except OSError:
             self._data = previous
             raise
@@ -99,24 +100,29 @@ class SettingsManager:
         return bool(self._data.get("password_hash"))
 
     def set_password(self, value: str) -> None:
+        self.update(self.password_record(value))
+
+    @staticmethod
+    def password_record(value: str) -> dict:
         if len(value) < 4 or len(value) > 128:
             raise ValueError("密码须为 4–128 个字符")
         salt = secrets.token_hex(16)
         digest = hashlib.pbkdf2_hmac("sha256", value.encode("utf-8"), bytes.fromhex(salt), ITERATIONS)
-        self.update({"password_salt": salt, "password_hash": digest.hex(), "password_iterations": ITERATIONS})
+        return {"password_salt": salt, "password_hash": digest.hex(), "password_iterations": ITERATIONS}
 
     def verify_password(self, candidate: str) -> bool:
-        if not self.has_password or len(candidate) > 128:
+        data = self._data.copy()
+        if not data.get("password_hash") or len(candidate) > 128:
             return False
         try:
-            rounds = int(self._data["password_iterations"])
+            rounds = int(data["password_iterations"])
             if not 100_000 <= rounds <= 1_000_000:
                 return False
-            salt = bytes.fromhex(self._data["password_salt"])
+            salt = bytes.fromhex(data["password_salt"])
             if len(salt) != 16:
                 return False
             digest = hashlib.pbkdf2_hmac("sha256", candidate.encode("utf-8"), salt, rounds)
-            return hmac.compare_digest(digest.hex(), self._data["password_hash"])
+            return hmac.compare_digest(digest.hex(), data["password_hash"])
         except (ValueError, KeyError, TypeError):
             return False
 

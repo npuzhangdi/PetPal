@@ -7,16 +7,21 @@
   tools/             —— 构建脚本（生成启动器与运行时），仅安装时需要
 """
 
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
 from PySide6.QtCore import QObject, Qt
-from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
+from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMessageBox
 from PySide6.QtGui import QAction, QIcon, QPixmap, QPainter, QColor, QPainterPath
 
-from widgets.desktop_pet import DesktopPet
-from widgets.privacy_screen import PrivacyScreen
 from widgets.password_dialog import PasswordDialog
-from widgets.settings_window import SettingsWindow
 from core.settings import SettingsManager
 from widgets.tray import create_tray, WindowsTray
+
+if TYPE_CHECKING:
+    from widgets.desktop_pet import DesktopPet
+    from widgets.privacy_screen import PrivacyScreen
+    from widgets.settings_window import SettingsWindow
 
 _APP_NAME = "PetPal"
 
@@ -54,9 +59,8 @@ class AppController(QObject):
         self.privacy: PrivacyScreen | None = None
         self.settings_window: SettingsWindow | None = None
 
-        # 状态（宠物显隐状态跨重启记住）
-        self._pet_visible: bool = self.settings.get("pet_visible", True)
         self._privacy_active = False
+        self._auth_busy = False
 
         # 托盘（带应用名 + 图标，任务管理器 / 托盘以 PetPal 显示）
         self.tray = create_tray(self.settings.root, self)
@@ -75,49 +79,49 @@ class AppController(QObject):
     # 公开接口
     # ------------------------------------------------------------------
     def start(self) -> None:
-        """启动时按上次的状态恢复：宠物若上次"显示"则显示。"""
-        if self._pet_visible:
-            self._show_pet()
+        """启动时恢复用户选择的桌宠状态。"""
+        self._sync_pet()
 
     # ------------------------------------------------------------------
     # 桌面宠物
     # ------------------------------------------------------------------
-    def _show_pet(self) -> None:
-        if self.pet is None:
-            self.pet = DesktopPet(self.settings)
-        if not self._privacy_active:
-            self.pet.show()
-        self._pet_visible = True
-        self.settings.set("pet_visible", True)
-        self._update_menu_states()
+    def _sync_pet(self) -> None:
+        if not self.settings.get("pet_enabled"):
+            if self.pet:
+                self.pet.hide()
+                self.pet.deleteLater()
+                self.pet = None
+        elif self.settings.get("pet_visible") and not self._privacy_active:
+            if self.pet is None:
+                from widgets.desktop_pet import DesktopPet
 
-    def _hide_pet(self) -> None:
-        if self.pet:
+                self.pet = DesktopPet(self.settings)
+            self.pet.show()
+        elif self.pet:
             self.pet.hide()
-        self._pet_visible = False
-        self.settings.set("pet_visible", False)
         self._update_menu_states()
 
     def _toggle_pet(self) -> None:
-        if self._pet_visible:
-            self._hide_pet()
-        else:
-            self._show_pet()
+        if self._privacy_active or not self.settings.get("pet_enabled"):
+            return
+        try:
+            self.settings.set("pet_visible", not self.settings.get("pet_visible"))
+        except OSError:
+            self._update_menu_states()
+            QMessageBox.warning(None, _APP_NAME, "保存失败，请检查软件目录是否可写")
+            return
+        self._sync_pet()
+        if self.settings_window:
+            self.settings_window.pet_visible.setChecked(self.settings.get("pet_visible"))
 
     # ------------------------------------------------------------------
     # 隐私屏
     # ------------------------------------------------------------------
     def _activate_privacy(self) -> None:
         """开启隐私屏：先弹密码框验证，成功后显示全屏遮罩。"""
-        if self._privacy_active or getattr(self, "_auth_busy", False):
+        if self._privacy_active:
             return
-        self._auth_busy = True
-        dlg = PasswordDialog(self.settings, None, title="开启隐私屏")
-        dlg.activateWindow()
-        dlg.raise_()
-        result = dlg.exec()
-        self._auth_busy = False
-        if result == PasswordDialog.DialogCode.Accepted:
+        if self._prompt_password(title="开启隐私屏"):
             self._do_activate_privacy()
 
     def _deactivate_privacy(self) -> None:
@@ -127,40 +131,36 @@ class AppController(QObject):
         if self.privacy:
             self.privacy.request_unlock()
         else:
-            dlg = PasswordDialog(self.settings, None, title="关闭隐私屏")
-            dlg.activateWindow()
-            dlg.raise_()
-            if dlg.exec() == PasswordDialog.DialogCode.Accepted:
+            if self._prompt_password(title="关闭隐私屏"):
                 self._do_deactivate_privacy()
 
     def _do_activate_privacy(self) -> None:
         if self.privacy is None:
+            from widgets.privacy_screen import PrivacyScreen
+
             self.privacy = PrivacyScreen(self.settings)
             self.privacy.unlock_accepted.connect(self._on_privacy_unlock)
             self.privacy.unlock_rejected.connect(self._on_privacy_unlock_rejected)
             self.privacy.user_activity.connect(self._on_privacy_user_activity)
         if self.settings_window:
             self.settings_window.hide()
-        self.privacy.reload_background()
         self.privacy.show()
         self.privacy.raise_()
         self.privacy.activateWindow()
         self.privacy.setFocus()
         self._privacy_active = True
-        if self._pet_visible and self.pet:
+        if self.pet and self.settings.get("pet_visible"):
             self.pet.on_privacy_screen_active(True)
-            self.pet.hide()
-        self._update_menu_states()
+        self._sync_pet()
 
     def _do_deactivate_privacy(self) -> None:
         if self.privacy:
             self.privacy.close_unlock_panel()
             self.privacy.hide()
         self._privacy_active = False
-        if self._pet_visible and self.pet:
+        if self.pet and self.settings.get("pet_visible"):
             self.pet.on_privacy_screen_active(False)
-            self.pet.show()
-        self._update_menu_states()
+        self._sync_pet()
 
     def _on_privacy_unlock(self) -> None:
         if self.pet:
@@ -174,7 +174,7 @@ class AppController(QObject):
             self.privacy.raise_()
 
     def _on_privacy_user_activity(self) -> None:
-        if self.pet and self._pet_visible:
+        if self.pet and self.settings.get("pet_visible"):
             self.pet.on_user_activity()
 
     def _toggle_privacy(self) -> None:
@@ -186,28 +186,44 @@ class AppController(QObject):
     # ------------------------------------------------------------------
     # 密码 / 设置面板
     # ------------------------------------------------------------------
+    def _password_prompt_active(self) -> bool:
+        return self._auth_busy or isinstance(self.app.activeModalWidget(), PasswordDialog)
+
+    def _prompt_password(self, **options) -> bool:
+        if self._password_prompt_active():
+            return False
+        self._auth_busy = True
+        try:
+            dlg = PasswordDialog(self.settings, **options)
+            return dlg.exec() == PasswordDialog.DialogCode.Accepted
+        finally:
+            self._auth_busy = False
+
     def _change_password(self) -> None:
         """托盘菜单修改密码；对话框要求当前密码与两次新密码。"""
         if self._privacy_active:
             self._deactivate_privacy()
             return
-        dlg = PasswordDialog(self.settings, None, edit_mode=True)
-        dlg.activateWindow()
-        dlg.raise_()
-        dlg.exec()
+        self._prompt_password(edit_mode=True)
 
     def _open_settings(self) -> None:
-        """打开独立设置窗口（两个页面：宠物 / 隐私屏）。"""
+        """打开独立设置窗口。"""
+        if self._password_prompt_active():
+            return
         if self._privacy_active:
             self._deactivate_privacy()
             return
         if self.settings_window is None:
+            from widgets.settings_window import SettingsWindow
+
             self.settings_window = SettingsWindow(self.settings)
             self.settings_window.quit_requested.connect(self._quit)
+            self.settings_window.privacy_requested.connect(self._activate_privacy)
             self.settings_window.settings_applied.connect(self._apply_settings_to_widgets)
             self.settings_window.pet_action.connect(self._pet_action)
+        elif not self.settings_window.isVisible():
+            self.settings_window._load_values()
         sw = self.settings_window
-        sw._load_values()
         sw.showNormal()
         sw.raise_()
         sw.activateWindow()
@@ -215,35 +231,28 @@ class AppController(QObject):
 
     def _apply_settings_to_widgets(self) -> None:
         """把当前设置应用到各组件（设置面板保存后调用）。"""
-        if self.pet:
-            self.pet.set_pet_type(self.settings.pet_type)
-            self.pet.set_pet_size(int(self.settings.pet_size))
-            self.pet.set_wander(bool(self.settings.pet_wander))
-            self.pet.set_clothing(str(self.settings.get("pet_clothing", "none")))
-            self.pet.set_mood(str(self.settings.get("pet_mood", "happy")))
-        visible = self.settings.get("pet_visible", True)
-        if visible != self._pet_visible:
-            self._show_pet() if visible else self._hide_pet()
+        if self.pet and self.settings.get("pet_enabled"):
+            self.pet.apply_settings()
+        self._sync_pet()
         self.apply_theme_to_app(self.app)
-        if self.privacy:
-            self.privacy.reload_background()
-        if self.settings_window:
-            self.settings_window._apply_theme_style()
 
     # ------------------------------------------------------------------
     # 退出
     # ------------------------------------------------------------------
     def _pet_action(self, action):
-        if self._privacy_active:
+        if not self.settings.get("pet_enabled") or self._privacy_active:
             return
-        self._show_pet()
-        self.pet.perform_action(action)
+        if not self.settings.get("pet_visible"):
+            self._toggle_pet()
+        if self.pet and self.pet.isVisible():
+            self.pet.perform_action(action)
 
     def _on_tray_unavailable(self, message):
         # Do not leave a tray-only application inaccessible when Explorer is unavailable.
         if not self._privacy_active:
             self._open_settings()
-            self.settings_window.status.setText(message)
+            if self.settings_window:
+                self.settings_window.status.setText(message)
 
     def cleanup(self) -> None:
         """退出前清理组件。全程 try/except 兜底，避免僵尸进程占住单实例锁。"""
@@ -264,7 +273,8 @@ class AppController(QObject):
             from widgets.theme import Theme
             theme_key = str(self.settings.get("ui_theme", "dark"))
             style = Theme(theme_key).style()
-            app.setStyleSheet(style)
+            if app.styleSheet() != style:
+                app.setStyleSheet(style)
         except Exception:
             pass
 
@@ -273,7 +283,7 @@ class AppController(QObject):
         try:
             if self._privacy_active:
                 self.privacy.request_unlock()
-            elif self.pet:
+            elif self.pet and self.pet.isVisible():
                 self.pet.raise_to_top()
             self.tray.show()
             if not self._privacy_active:
@@ -283,13 +293,11 @@ class AppController(QObject):
 
     def _quit(self) -> None:
         """隐私屏开启时必须验证密码；解锁后才允许退出。"""
+        if self._password_prompt_active():
+            return
         if self._privacy_active or (self.settings.has_password and self.settings.get("password_protect_quit", True)):
-            dlg = PasswordDialog(self.settings, None, title="退出程序")
-            dlg.activateWindow()
-            dlg.raise_()
-            if dlg.exec() != PasswordDialog.DialogCode.Accepted:
+            if not self._prompt_password(title="退出程序"):
                 return
-        self.settings.set("pet_visible", self._pet_visible)
         if self.privacy:
             self._privacy_active = False
             self.privacy.hide()
@@ -300,13 +308,12 @@ class AppController(QObject):
 
     def prepare_setup_exit(self) -> bool:
         """Allow repair to close an unprotected instance, preserving password gates."""
-        if getattr(self, "_auth_busy", False):
+        if self._password_prompt_active():
             return False
         if self._privacy_active or (
                 self.settings.has_password and self.settings.get("password_protect_quit", True)):
             self.activate()
             return False
-        self.settings.set("pet_visible", self._pet_visible)
         return True
 
     # ------------------------------------------------------------------
@@ -320,7 +327,7 @@ class AppController(QObject):
         self.act_pet.triggered.connect(self._toggle_pet)
         menu.addAction(self.act_pet)
 
-        menu.addSeparator()
+        self.pet_separator = menu.addSeparator()
 
         self.act_privacy_on = QAction("开启隐私屏（需密码）", menu)
         self.act_privacy_on.triggered.connect(self._activate_privacy)
@@ -351,8 +358,11 @@ class AppController(QObject):
         self._update_menu_states()
 
     def _update_menu_states(self) -> None:
-        self.act_pet.setChecked(self._pet_visible)
-        self.act_pet.setEnabled(not self._privacy_active)
+        enabled = self.settings.get("pet_enabled")
+        self.act_pet.setVisible(enabled)
+        self.pet_separator.setVisible(enabled)
+        self.act_pet.setChecked(enabled and self.settings.get("pet_visible"))
+        self.act_pet.setEnabled(enabled and not self._privacy_active)
         self.act_settings.setEnabled(not self._privacy_active)
         self.act_pwd.setEnabled(not self._privacy_active)
         self.act_privacy_on.setEnabled(not self._privacy_active)

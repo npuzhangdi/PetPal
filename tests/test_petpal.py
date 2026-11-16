@@ -1,23 +1,26 @@
 """Security, UI lifecycle and portable-config regression tests. Standard unittest."""
 import json
 import os
+import shutil
 import sys
 import tempfile
+import time
 import unittest
+from threading import Event
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PySide6.QtCore import Qt, QObject, Signal, QRect
-from PySide6.QtGui import QCloseEvent, QPixmap, QFontDatabase
+from PySide6.QtCore import Qt, QObject, Signal, QRect, QTimer
+from PySide6.QtGui import QColor, QCloseEvent, QPixmap, QFontDatabase
 from PySide6.QtWidgets import QApplication, QDialog
 from PySide6.QtTest import QTest
 from core.settings import SettingsManager
 from widgets.password_dialog import PasswordDialog
 from widgets.settings_window import SettingsWindow
-from widgets.privacy_screen import PrivacyScreen, ScreenCover
+from widgets.privacy_screen import PrivacyScreen
 from widgets.desktop_pet import DesktopPet
 from widgets.theme import THEMES
 from widgets.tray import WindowsTray, NotifyData
@@ -56,6 +59,10 @@ class PetPalTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="petpal-test-")
         self.root = Path(self.temp.name)
+        assets = self.root / "assets"
+        assets.mkdir()
+        for name in ("petpal.ico", "petpal_icon.png"):
+            shutil.copyfile(ROOT / "assets" / name, assets / name)
         self.settings = SettingsManager(self.root)
         self.windows = []
 
@@ -68,6 +75,14 @@ class PetPalTests(unittest.TestCase):
             window.deleteLater()
         APP.processEvents()
         self.temp.cleanup()
+
+    def wait_until(self, condition):
+        deadline = time.monotonic() + 5
+        while not condition():
+            APP.processEvents()
+            if time.monotonic() >= deadline:
+                self.fail("Timed out waiting for the GUI operation")
+            time.sleep(0.005)
 
     def test_password_roundtrip_and_salt(self):
         s = self.settings
@@ -88,6 +103,7 @@ class PetPalTests(unittest.TestCase):
         self.assertEqual(self.settings.pet_size, 160)
         self.assertEqual(self.settings.pet_type, "cat")
         path = self.root / "config/settings.json"
+        path.parent.mkdir()
         path.write_text("{broken", encoding="utf-8")
         restored = SettingsManager(self.root)
         self.assertTrue(restored.recovered)
@@ -106,9 +122,11 @@ class PetPalTests(unittest.TestCase):
         dialog._new_edit.setText("12345")
         dialog._confirm_edit.setText("54321")
         dialog._on_accept()
+        self.wait_until(lambda: dialog._task is None)
         self.assertFalse(self.settings.has_password)
         dialog._confirm_edit.setText("12345")
         dialog._on_accept()
+        self.wait_until(lambda: dialog._task is None)
         self.assertEqual(dialog.result(), QDialog.Accepted)
 
     def test_password_change_requires_current_password(self):
@@ -119,6 +137,7 @@ class PetPalTests(unittest.TestCase):
         dialog._confirm_edit.setText("new-password")
         dialog._pwd_edit.setText("wrong-password")
         dialog._on_accept()
+        self.wait_until(lambda: dialog._task is None)
         self.assertTrue(self.settings.verify_password("old-password"))
         self.assertFalse(dialog.ok.isEnabled())
         dialog._pwd_edit.setText("old-password")
@@ -126,6 +145,7 @@ class PetPalTests(unittest.TestCase):
         self.assertTrue(self.settings.verify_password("old-password"))
         dialog._ready()
         dialog._on_accept()
+        self.wait_until(lambda: dialog._task is None)
         self.assertTrue(self.settings.verify_password("new-password"))
 
     def test_settings_two_pages_all_themes_and_visibility(self):
@@ -134,10 +154,17 @@ class PetPalTests(unittest.TestCase):
         window.show()
         APP.processEvents()
         self.assertEqual(window.tabs.count(), 2)
+        self.assertEqual(window.tabs.tabText(0), "隐私屏")
+        self.assertFalse(window.pet_enabled.isChecked())
+        self.assertTrue(window.pet_controls.isHidden())
         quit_requested = Mock()
         window.quit_requested.connect(quit_requested)
         window.quit_button.click()
         quit_requested.assert_called_once_with()
+        privacy_requested = Mock()
+        window.privacy_requested.connect(privacy_requested)
+        window.privacy_button.click()
+        privacy_requested.assert_called_once_with()
         for key in THEMES:
             window._choose(window.theme_combo, key)
             self.assertFalse(window.grab().isNull())
@@ -163,9 +190,15 @@ class PetPalTests(unittest.TestCase):
         window._image_path = str(source)
         window.privacy_bg_type.setCurrentIndex(1)
         self.assertTrue(window._collect())
+        self.wait_until(lambda: window._save_task is None and window._preview_task is None)
         self.assertTrue(self.settings.get("privacy_image").startswith("photos/"))
         self.assertTrue(Path(self.settings.privacy_image).exists())
         self.assertFalse(window.preview_label.pixmap().isNull())
+        window.pet_enabled.setChecked(True)
+        with patch("widgets.settings_window._store_background") as store:
+            window.apply_only()
+            store.assert_not_called()
+        self.assertTrue(self.settings.get("pet_enabled"))
 
     def test_privacy_needs_password(self):
         privacy = PrivacyScreen(self.settings)
@@ -182,6 +215,7 @@ class PetPalTests(unittest.TestCase):
         privacy.show()
         self.assertEqual(len(privacy.covers), len(APP.screens()))
         cover = privacy.covers[0]
+        self.assertFalse(cover._refresh.isActive())
         cover.open_panel()
         QTest.keyClick(cover.password, Qt.Key_Escape)
         self.assertFalse(cover.panel.isVisible())
@@ -189,6 +223,8 @@ class PetPalTests(unittest.TestCase):
         cover.open_panel()
         cover.password.setText("wrong-password")
         cover.submit()
+        self.wait_until(lambda: not privacy.verifying)
+        self.assertTrue(cover._refresh.isActive())
         self.assertFalse(accepted)
         self.assertTrue(privacy.active)
         cover.password.setText("right-password")
@@ -197,10 +233,65 @@ class PetPalTests(unittest.TestCase):
         close = QCloseEvent()
         cover.closeEvent(close)
         self.assertFalse(close.isAccepted())
+        cover.close_panel()
+        self.assertFalse(cover._refresh.isActive())
         privacy.blocked_until = 0
+        cover.open_panel()
         cover.password.setText("right-password")
         cover.submit()
+        self.wait_until(lambda: not privacy.verifying)
         self.assertEqual(accepted, [True])
+
+    def test_unlock_keeps_ui_responsive_and_only_checks_once(self):
+        self.settings.set_password("right-password")
+        privacy = PrivacyScreen(self.settings)
+        self.windows.append(privacy)
+        privacy.show()
+        cover = privacy.covers[0]
+        cover.open_panel()
+        entered, release = Event(), Event()
+
+        def slow_verify(candidate):
+            entered.set()
+            return release.wait(5) and candidate == "right-password"
+
+        with patch.object(self.settings, "verify_password", side_effect=slow_verify) as verify:
+            cover.password.setText("right-password")
+            cover.submit()
+            try:
+                self.wait_until(entered.is_set)
+                fired = []
+                QTimer.singleShot(0, lambda: fired.append(True))
+                self.wait_until(lambda: bool(fired))
+                self.assertTrue(privacy.active)
+                self.assertTrue(privacy.verifying)
+                self.assertFalse(cover.unlock.isEnabled())
+                cover.submit()
+                verify.assert_called_once_with("right-password")
+            finally:
+                release.set()
+            self.wait_until(lambda: not privacy.verifying)
+
+    def test_privacy_image_renders_after_cover_appears(self):
+        source = self.root / "wide.png"
+        image = QPixmap(1600, 100)
+        image.fill(Qt.green)
+        self.assertTrue(image.save(str(source)))
+        self.settings.set_password("right-password")
+        self.settings.update({"privacy_bg_type": "image", "privacy_image": str(source)})
+        privacy = PrivacyScreen(self.settings)
+        self.windows.append(privacy)
+        privacy.show()
+        cover = privacy.covers[0]
+        self.assertTrue(cover.isVisible())
+        self.assertTrue(cover._background.isNull())
+        self.assertEqual(cover.grab().toImage().pixelColor(0, 0), QColor(self.settings.privacy_color))
+        self.wait_until(lambda: not cover._background.isNull())
+        self.assertEqual(cover._background.size(), cover.size() * cover.devicePixelRatioF())
+        self.assertEqual(cover.grab().toImage().pixelColor(0, 0), QColor(Qt.green))
+        privacy.hide()
+        self.assertTrue(privacy.image.isNull())
+        self.assertFalse(privacy.covers)
 
     def test_hotplug_negative_origin_and_removal(self):
         class Monitor(QObject):
@@ -220,7 +311,6 @@ class PetPalTests(unittest.TestCase):
         self.assertEqual(len(privacy.covers), initial)
 
     def test_controller_password_gates_and_live_settings(self):
-        from unittest.mock import patch
         from core.app import AppController
         self.settings.set_password("password")
         with patch("core.app.SettingsManager", return_value=self.settings):
@@ -228,9 +318,8 @@ class PetPalTests(unittest.TestCase):
         controller.start()
         try:
             self.assertIsNone(controller.settings_window)
-            self.settings.set("pet_visible", False)
-            controller._apply_settings_to_widgets()
-            self.assertFalse(controller.pet.isVisible())
+            self.assertIsNone(controller.pet)
+            self.assertFalse(controller.act_pet.isVisible())
             with patch("core.app.PasswordDialog.exec", return_value=QDialog.Rejected):
                 controller._activate_privacy()
                 self.assertFalse(controller._privacy_active)
@@ -247,11 +336,65 @@ class PetPalTests(unittest.TestCase):
             self.assertFalse(controller._privacy_active)
         finally:
             controller.cleanup()
-            controller.tray.hide()
+            controller.tray.deleteLater()
+
+    def test_pet_requires_settings_opt_in_and_persists(self):
+        from core.app import AppController
+
+        path = self.root / "config/settings.json"
+        path.parent.mkdir()
+        path.write_text('{"pet_visible": true, "pet_type": "rabbit"}', encoding="utf-8")
+        with patch("core.app.SettingsManager", return_value=SettingsManager(self.root)):
+            controller = AppController(APP)
+        controller.start()
+        try:
+            self.assertIsNone(controller.pet)
+            self.assertFalse(controller.act_pet.isVisible())
+            controller._pet_action("eat")
+            controller._toggle_pet()
+            self.assertIsNone(controller.pet)
+            controller._open_settings()
+            window = controller.settings_window
+            self.windows.append(window)
+            window.pet_enabled.setChecked(True)
+            self.assertIsNone(controller.pet)
+            window.apply_only()
+            pet = controller.pet
+            self.assertTrue(pet.isVisible())
+            self.assertEqual(pet._pet_type, "rabbit")
+            self.assertTrue(controller.act_pet.isVisible())
+            with patch.object(pet, "_load_pet", wraps=pet._load_pet) as load, \
+                 patch.object(controller.settings, "_save", wraps=controller.settings._save) as save:
+                window.apply_only()
+                load.assert_not_called()
+                save.assert_not_called()
+            restored = SettingsManager(self.root)
+            self.assertTrue(restored.get("pet_enabled"))
+            with patch("core.app.SettingsManager", return_value=restored):
+                restarted = AppController(APP)
+            try:
+                restarted.start()
+                self.assertTrue(restarted.pet.isVisible())
+                restarted.act_pet.trigger()
+                self.assertFalse(restarted.pet.isVisible())
+                self.assertFalse(restarted.pet._anim_timer.isActive())
+                self.assertFalse(SettingsManager(self.root).get("pet_visible"))
+                restarted.act_pet.trigger()
+                self.assertTrue(restarted.pet._anim_timer.isActive())
+            finally:
+                restarted.cleanup()
+                restarted.tray.deleteLater()
+            window.pet_enabled.setChecked(False)
+            window.apply_only()
+            self.assertIsNone(controller.pet)
+            self.assertFalse(pet._anim_timer.isActive())
+            self.assertFalse(controller.act_pet.isVisible())
+            self.assertFalse(SettingsManager(self.root).get("pet_enabled"))
+        finally:
+            controller.cleanup()
             controller.tray.deleteLater()
 
     def test_setup_exit_respects_privacy_and_password_protection(self):
-        from unittest.mock import patch
         from core.app import AppController
         with patch("core.app.SettingsManager", return_value=self.settings):
             controller = AppController(APP)

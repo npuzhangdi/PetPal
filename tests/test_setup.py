@@ -1,6 +1,7 @@
 """Installer regressions, including the real GUI launcher's delayed probe race."""
 import contextlib
 import io
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -14,10 +15,84 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 import install
 import windows_integrity as integrity
-from build import find_csc
+from build import build, find_csc
 
 
 class SetupTests(unittest.TestCase):
+    def make_uninstall_fixture(self, root):
+        for name in ("tools", "assets", "photos", ".venv", "cache", "config"):
+            (root / name).mkdir()
+        for name in ("main.py", "photos/keep.png", "config/settings.json", ".venv/runtime", "cache/log"):
+            (root / name).write_text("fixture", encoding="utf-8")
+        for name in ("tools/uninstaller.cs", "assets/petpal.ico"):
+            shutil.copyfile(ROOT / name, root / name)
+        integrity._create_labeled_file(root / "uninstall.exe", b"MZold uninstall", level=0x1000)
+        integrity._create_labeled_file(root / "PetPal.exe", b"MZlauncher")
+        build(root, uninstaller_only=True)
+        self.assertGreaterEqual(integrity.file_integrity(root / "uninstall.exe"), integrity.MEDIUM)
+
+    def wait_for_uninstaller_cleanup(self, root):
+        deadline = time.monotonic() + 8
+        while (root / "uninstall.exe").exists() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertFalse((root / "uninstall.exe").exists())
+
+    @unittest.skipIf(integrity.process_integrity() < integrity.MEDIUM, "需要普通用户桌面进程")
+    def test_uninstaller_retries_locked_launcher_without_losing_user_data(self):
+        with tempfile.TemporaryDirectory(prefix="PetPal's uninstall test ") as directory:
+            root = Path(directory)
+            self.make_uninstall_fixture(root)
+            launcher = root / "PetPal.exe"
+            command = [str(root / "uninstall.exe"), "--silent"]
+            with launcher.open("rb"):
+                result = subprocess.run(command, timeout=12)
+                self.assertEqual(result.returncode, 1)
+                self.assertTrue((root / ".venv/runtime").is_file())
+                self.assertTrue((root / "cache/log").is_file())
+                self.assertTrue((root / "config/settings.json").is_file())
+            with launcher.open("rb") as lock:
+                with subprocess.Popen(command) as uninstall:
+                    time.sleep(0.5)
+                    self.assertIsNone(uninstall.poll())
+                    lock.close()
+                    self.assertEqual(uninstall.wait(timeout=10), 0)
+            self.wait_for_uninstaller_cleanup(root)
+            self.assertFalse(launcher.exists())
+            for name in (".venv", "cache", "config"):
+                self.assertFalse((root / name).exists())
+            for name in ("main.py", "tools/uninstaller.cs", "photos/keep.png"):
+                self.assertTrue((root / name).is_file())
+
+    @unittest.skipIf(integrity.process_integrity() < integrity.MEDIUM, "需要普通用户桌面进程")
+    def test_uninstaller_does_not_kill_running_instance_and_can_keep_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_uninstall_fixture(root)
+            launcher = root / "PetPal.exe"
+            stub = root / "running.cs"
+            stub.write_text("class Stub { static void Main() { System.Threading.Thread.Sleep(15000); } }",
+                            encoding="utf-8")
+            runtime = root / ".venv" / "Scripts" / "PetPal.exe"
+            runtime.parent.mkdir()
+            built = subprocess.run([str(find_csc()), "/nologo", "/target:winexe",
+                "/out:" + str(runtime), str(stub)], capture_output=True, timeout=20)
+            self.assertEqual(built.returncode, 0, built.stdout)
+            integrity.prepare_desktop_executable(runtime, root)
+            command = [str(root / "uninstall.exe"), "--silent", "--keep-user-data"]
+            with subprocess.Popen([str(runtime)]) as running:
+                try:
+                    self.assertEqual(subprocess.run(command, timeout=10).returncode, 1)
+                    self.assertIsNone(running.poll())
+                    self.assertTrue(launcher.is_file())
+                    self.assertTrue(runtime.is_file())
+                finally:
+                    if running.poll() is None:
+                        running.terminate()
+            self.assertEqual(subprocess.run(command, timeout=10).returncode, 0)
+            self.wait_for_uninstaller_cleanup(root)
+            self.assertTrue((root / "config/settings.json").is_file())
+            self.assertFalse(runtime.exists())
+
     def test_running_instance_stops_before_repair(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

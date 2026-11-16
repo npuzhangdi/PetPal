@@ -1,9 +1,9 @@
 """Two-page settings window; draft values are committed only on Apply."""
 from pathlib import Path
 import hashlib
-import shutil
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QPixmap
+import tempfile
+from PySide6.QtCore import QSize, Qt, Signal, Slot
+from PySide6.QtGui import QColor, QImage, QImageReader, QPixmap
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
     QComboBox, QCheckBox, QPushButton, QSlider, QTabWidget, QScrollArea,
     QColorDialog, QFileDialog, QFrame)
@@ -11,13 +11,54 @@ from core.settings import SettingsManager
 from widgets.theme import Theme, THEMES
 from widgets.password_dialog import PasswordDialog
 from widgets.rounded import round_window
+from widgets.background_task import BackgroundTask
 
 PETS = {"cat": "小猫", "dog": "小狗", "cow": "小牛", "rabbit": "小兔"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 
 
+def _read_preview(path):
+    reader = QImageReader(path)
+    size = reader.size()
+    if size.isValid():
+        reader.setScaledSize(size.scaled(QSize(390, 140), Qt.KeepAspectRatio))
+    return reader.read()
+
+
+def _store_background(path, root, image_mode):
+    source = Path(path).resolve()
+    if not source.is_file():
+        if image_mode:
+            raise ValueError("请先选择一张可读取的背景图片")
+        return ""
+    photos = root / "photos"
+    photos.mkdir(exist_ok=True)
+    if source.parent == photos.resolve():
+        if image_mode and _read_preview(str(source)).isNull():
+            raise ValueError("请先选择一张可读取的背景图片")
+        return source.relative_to(root).as_posix()
+
+    digest = hashlib.sha256()
+    temporary = tempfile.NamedTemporaryFile(dir=photos, suffix=".tmp", delete=False)
+    staged = Path(temporary.name)
+    try:
+        with temporary, source.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+                temporary.write(chunk)
+        if image_mode and _read_preview(str(staged)).isNull():
+            raise ValueError("请先选择一张可读取的背景图片")
+        target = photos / ("import_" + digest.hexdigest()[:12] + source.suffix.lower())
+        if not target.exists():
+            staged.replace(target)
+    finally:
+        staged.unlink(missing_ok=True)
+    return target.relative_to(root).as_posix()
+
+
 class SettingsWindow(QWidget):
     settings_applied = Signal()
+    privacy_requested = Signal()
     pet_action = Signal(str)
     quit_requested = Signal()
 
@@ -29,6 +70,10 @@ class SettingsWindow(QWidget):
         self.setMinimumWidth(540)
         self.resize(600, min(720, self.screen().availableGeometry().height() - 48))
         self._drag_pos = None
+        self._preview_task = None
+        self._loaded_preview_path = ""
+        self._preview_image = QPixmap()
+        self._save_task = None
         outer = QVBoxLayout(self)
         outer.setContentsMargins(24, 22, 24, 20)
         outer.setSpacing(16)
@@ -49,12 +94,9 @@ class SettingsWindow(QWidget):
         close.clicked.connect(self.hide)
         header.addWidget(close)
         outer.addLayout(header)
-        subtitle = QLabel("你的桌面伙伴，也为你的屏幕留一点私人空间。")
-        subtitle.setWordWrap(True)
-        outer.addWidget(subtitle)
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._scroll(self._pet_page()), "桌面宠物")
         self.tabs.addTab(self._scroll(self._privacy_page()), "隐私屏")
+        self.tabs.addTab(self._scroll(self._pet_page()), "桌面宠物")
         outer.addWidget(self.tabs, 1)
         self.status = QLabel("设置只保存在此软件目录")
         self.status.setWordWrap(True)
@@ -88,11 +130,18 @@ class SettingsWindow(QWidget):
 
     def _pet_page(self):
         page, form = self._page()
+        self.pet_enabled = QCheckBox("启用桌面宠物")
+        self.pet_enabled.toggled.connect(self._sync_pet_controls)
+        form.addRow(self.pet_enabled)
+        self.pet_controls, form = self._page()
+        page.layout().addRow(self.pet_controls)
+        form.setContentsMargins(0, 0, 0, 0)
         self.pet_preview = QLabel()
         self.pet_preview.setAlignment(Qt.AlignCenter)
         self.pet_preview.setMinimumHeight(112)
         form.addRow(self.pet_preview)
         self.pet_type = QComboBox()
+        self._pet_previews = {}
         for key, name in PETS.items():
             self.pet_type.addItem(name, key)
         self.pet_type.currentIndexChanged.connect(self._update_pet_preview)
@@ -117,12 +166,14 @@ class SettingsWindow(QWidget):
         for key, name in (("happy", "开心"), ("cool", "酷酷的"), ("party", "派对")):
             self.pet_mood.addItem(name, key)
         form.addRow("心情", self.pet_mood)
-        actions = QHBoxLayout()
+        self.pet_actions = QWidget()
+        actions = QHBoxLayout(self.pet_actions)
+        actions.setContentsMargins(0, 0, 0, 0)
         for text, key in (("喂饭", "eat"), ("玩球", "play"), ("睡觉", "sleep"), ("回窝", "home")):
             button = QPushButton(text)
             button.clicked.connect(lambda checked=False, k=key: self.pet_action.emit(k))
             actions.addWidget(button)
-        form.addRow("陪它一会儿", actions)
+        form.addRow("陪它一会儿", self.pet_actions)
         note = QLabel("拖动桌宠可改变位置，右键可切换伙伴与穿搭。隐私屏开启时，桌宠会暂时休息。")
         note.setWordWrap(True)
         form.addRow(note)
@@ -159,6 +210,9 @@ class SettingsWindow(QWidget):
         self.password_button = QPushButton("修改隐私密码")
         self.password_button.clicked.connect(self._change_password)
         form.addRow("密码管理", self.password_button)
+        self.privacy_button = QPushButton("开启隐私屏")
+        self.privacy_button.clicked.connect(self.privacy_requested.emit)
+        form.addRow(self.privacy_button)
         self.protect_quit = QCheckBox("平时退出也验证密码（隐私屏开启时始终验证）")
         form.addRow(self.protect_quit)
         return page
@@ -168,6 +222,8 @@ class SettingsWindow(QWidget):
         combo.setCurrentIndex(max(0, index))
 
     def _load_values(self):
+        if self._save_task is not None:
+            return
         s = self.settings
         self._color = s.privacy_color
         self._image_path = s.privacy_image
@@ -175,7 +231,9 @@ class SettingsWindow(QWidget):
         for key in ("pet_type", "pet_clothing", "pet_mood", "privacy_bg_type"):
             self._choose(getattr(self, key), s.get(key))
         self.pet_size.setValue(s.pet_size)
-        self.pet_visible.setChecked(s.get("pet_visible"))
+        enabled = s.get("pet_enabled")
+        self.pet_enabled.setChecked(enabled)
+        self.pet_visible.setChecked(s.get("pet_visible") if enabled else True)
         self.pet_wander.setChecked(s.pet_wander)
         self.protect_quit.setChecked(s.get("password_protect_quit"))
         self.password_button.setText("修改隐私密码" if s.has_password else "设置隐私密码")
@@ -192,15 +250,28 @@ class SettingsWindow(QWidget):
         self.status.setText("设置只保存在此软件目录")
         self._sync_bg_rows()
         self._apply_theme_style()
-        self._update_pet_preview()
+        self._sync_pet_controls()
 
     def _apply_theme_style(self, *args):
-        self.setStyleSheet(Theme(self.theme_combo.currentData() or "dark").style())
+        style = Theme(self.theme_combo.currentData() or "dark").style()
+        if self.styleSheet() != style:
+            self.setStyleSheet(style)
+
+    def _sync_pet_controls(self, *args):
+        enabled = self.pet_enabled.isChecked()
+        self.pet_controls.setVisible(enabled)
+        self.pet_actions.setEnabled(self.settings.get("pet_enabled"))
+        if enabled:
+            self._update_pet_preview()
 
     def _update_pet_preview(self, *args):
+        if not self.pet_enabled.isChecked():
+            return
         key = self.pet_type.currentData() or "cat"
-        image = QPixmap(str(self.settings.root / "assets" / "pets" / key / "standing.png"))
-        self.pet_preview.setPixmap(image.scaled(120, 120, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        if key not in self._pet_previews:
+            image = QPixmap(str(self.settings.root / "assets" / "pets" / key / "standing.png"))
+            self._pet_previews[key] = image.scaled(120, 120, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.pet_preview.setPixmap(self._pet_previews[key])
 
     def _sync_bg_rows(self, *args):
         if not hasattr(self, "gallery"):
@@ -216,13 +287,30 @@ class SettingsWindow(QWidget):
             return
         self.color_button.setText("选择颜色 · " + self._color.upper())
         self.image_name.setText(Path(self._image_path).name if self._image_path else "导入的图片会复制到 photos/，便于移动软件。")
-        self.preview_label.clear()
         if self.privacy_bg_type.currentData() == "image" and self._image_path:
-            image = QPixmap(self._image_path)
-            self.preview_label.setPixmap(image.scaled(390, 140, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            path = self._image_path
+            if path == self._loaded_preview_path:
+                if self._preview_image.isNull():
+                    self.preview_label.setText("无法读取这张图片")
+                else:
+                    self.preview_label.setPixmap(self._preview_image)
+            else:
+                self.preview_label.setText("正在加载图片…")
+                if self._preview_task is None:
+                    self._loading_preview_path = path
+                    self._preview_task = BackgroundTask(lambda: _read_preview(path), self._preview_loaded)
         else:
             self.preview_label.setText("隐私屏背景预览")
-        self.preview_label.setStyleSheet(f"background:{self._color}; color:white; border-radius:12px;")
+        style = f"background:{self._color}; color:white; border-radius:12px;"
+        if self.preview_label.styleSheet() != style:
+            self.preview_label.setStyleSheet(style)
+
+    @Slot(object, object)
+    def _preview_loaded(self, task, image):
+        self._preview_task = None
+        self._loaded_preview_path = self._loading_preview_path
+        self._preview_image = QPixmap.fromImage(image) if isinstance(image, QImage) else QPixmap()
+        self._update_preview()
 
     def _on_pick_color(self):
         color = QColorDialog.getColor(QColor(self._color), self, "选择隐私屏颜色")
@@ -233,9 +321,7 @@ class SettingsWindow(QWidget):
     def _on_pick_image(self):
         path, _ = QFileDialog.getOpenFileName(self, "导入隐私屏图片", str(self.settings.root / "photos"), "图片 (*.png *.jpg *.jpeg *.bmp *.webp)")
         if path:
-            if QPixmap(path).isNull():
-                self.status.setText("无法读取这张图片，请选择其他图片")
-                return
+            self._loaded_preview_path = ""
             self._image_path = path
             self._update_preview()
 
@@ -251,44 +337,72 @@ class SettingsWindow(QWidget):
             self.password_button.setText("修改隐私密码")
             self.status.setText("隐私密码已更新")
 
-    def _collect(self):
-        if self.privacy_bg_type.currentData() == "image" and (not self._image_path or QPixmap(self._image_path).isNull()):
+    def _collect(self, close_after=False):
+        if self._save_task is not None:
+            return False
+        bg_type = self.privacy_bg_type.currentData()
+        if bg_type == "image" and not self._image_path:
             self.status.setText("请先选择一张可读取的背景图片")
             return False
+        values = {
+            "pet_type": self.pet_type.currentData(), "pet_size": self.pet_size.value(),
+            "pet_enabled": self.pet_enabled.isChecked(), "pet_visible": self.pet_visible.isChecked(),
+            "pet_wander": self.pet_wander.isChecked(),
+            "pet_clothing": self.pet_clothing.currentData(), "pet_mood": self.pet_mood.currentData(),
+            "ui_theme": self.theme_combo.currentData(), "privacy_bg_type": bg_type,
+            "privacy_color": self._color, "privacy_image": self.settings.get("privacy_image"),
+            "password_protect_quit": self.protect_quit.isChecked(),
+        }
+        path, root = self._image_path, self.settings.root
+        if not path:
+            values["privacy_image"] = ""
+            return self._commit(values, close_after)
+        if path == self.settings.privacy_image and (
+                bg_type == "color" or bg_type == self.settings.privacy_bg_type):
+            return self._commit(values, close_after)
+        self._pending_save = values, close_after
+        self.status.setText("正在检查并保存背景图片…")
+        self.setEnabled(False)
+        self._save_task = BackgroundTask(
+            lambda: _store_background(path, root, bg_type == "image"), self._background_stored)
+        return True
+
+    @Slot(object, object)
+    def _background_stored(self, task, result):
+        self._save_task = None
+        self.setEnabled(True)
+        values, close_after = self._pending_save
+        if isinstance(result, Exception):
+            self.status.setText("保存失败：" + str(result))
+            return
+        values["privacy_image"] = result
+        if self._commit(values, close_after):
+            if self._loaded_preview_path == self._image_path:
+                self._loaded_preview_path = self.settings.privacy_image
+            self._image_path = self.settings.privacy_image
+            if self._image_path and self.gallery.findData(self._image_path) == -1:
+                self.gallery.addItem(Path(self._image_path).name, self._image_path)
+            self._choose(self.gallery, self._image_path)
+            self._update_preview()
+
+    def _commit(self, values, close_after):
         try:
-            image_value = ""
-            if self._image_path and Path(self._image_path).is_file():
-                source = Path(self._image_path).resolve()
-                photos = self.settings.root / "photos"
-                photos.mkdir(exist_ok=True)
-                if source.parent != photos.resolve():
-                    digest = hashlib.sha256(source.read_bytes()).hexdigest()[:12]
-                    target = photos / ("import_" + digest + source.suffix.lower())
-                    if not target.exists():
-                        shutil.copy2(source, target)
-                    source = target
-                image_value = source.relative_to(self.settings.root).as_posix()
-            self.settings.update({
-                "pet_type": self.pet_type.currentData(), "pet_size": self.pet_size.value(),
-                "pet_visible": self.pet_visible.isChecked(), "pet_wander": self.pet_wander.isChecked(),
-                "pet_clothing": self.pet_clothing.currentData(), "pet_mood": self.pet_mood.currentData(),
-                "ui_theme": self.theme_combo.currentData(), "privacy_bg_type": self.privacy_bg_type.currentData(),
-                "privacy_color": self._color, "privacy_image": image_value,
-                "password_protect_quit": self.protect_quit.isChecked(),
-            })
+            self.settings.update(values)
         except (OSError, ValueError) as exc:
             self.status.setText("保存失败：" + str(exc))
             return False
         self.settings_applied.emit()
+        self._sync_pet_controls()
         self.status.setText("设置已保存并应用")
+        if close_after:
+            self.hide()
         return True
 
     def apply_only(self):
         self._collect()
 
     def _accept(self):
-        if self._collect():
-            self.hide()
+        self._collect(close_after=True)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

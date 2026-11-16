@@ -1,8 +1,9 @@
 """Shared password challenge; password changes verify the old password."""
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Slot
 from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton
 from widgets.theme import Theme
 from widgets.rounded import round_window
+from widgets.background_task import BackgroundTask
 
 
 class PasswordDialog(QDialog):
@@ -30,16 +31,17 @@ class PasswordDialog(QDialog):
         self.error.setWordWrap(True)
         layout.addWidget(self.error)
         row = QHBoxLayout()
-        cancel = QPushButton("取消")
-        cancel.clicked.connect(self.reject)
+        self.cancel = QPushButton("取消")
+        self.cancel.clicked.connect(self.reject)
         self.ok = QPushButton("保存密码" if self._edit_mode else "验证")
         self.ok.setDefault(True)
         self.ok.clicked.connect(self._on_accept)
-        row.addWidget(cancel)
+        row.addWidget(self.cancel)
         row.addWidget(self.ok)
         layout.addLayout(row)
         self._attempts = 0
         self._cooling = False
+        self._task = None
         self._cooldown = QTimer(self)
         self._cooldown.setSingleShot(True)
         self._cooldown.timeout.connect(self._ready)
@@ -59,9 +61,42 @@ class PasswordDialog(QDialog):
         self.error.setText("请重新输入密码")
 
     def _on_accept(self):
-        if self._cooling:
+        if self._cooling or self._task is not None:
             return
-        if self.settings.has_password and not self.settings.verify_password(self._pwd_edit.text()):
+        current = self._pwd_edit.text() if self._pwd_edit is not None else None
+        value = self._new_edit.text() if self._edit_mode else None
+        confirmation = self._confirm_edit.text() if self._edit_mode else None
+        settings = self.settings
+
+        def check_password():
+            if current is not None and not settings.verify_password(current):
+                return False
+            if value is None:
+                return True
+            if not 4 <= len(value) <= 128:
+                return "密码须为 4–128 个字符"
+            if value != confirmation:
+                return "两次新密码不一致"
+            return settings.password_record(value)
+
+        self._set_checking(True)
+        self.error.setText("正在处理密码…")
+        self._task = BackgroundTask(check_password, self._password_checked)
+
+    def _set_checking(self, checking):
+        self.ok.setEnabled(not checking)
+        self.cancel.setEnabled(not checking)
+        for field in self.findChildren(QLineEdit):
+            field.setReadOnly(checking)
+
+    @Slot(object, object)
+    def _password_checked(self, task, result):
+        self._task = None
+        self._set_checking(False)
+        if isinstance(result, Exception):
+            self.error.setText("密码处理失败，请重试")
+            return
+        if result is False:
             self._attempts += 1
             self._cooling = True
             self.ok.setEnabled(False)
@@ -71,20 +106,20 @@ class PasswordDialog(QDialog):
             self._pwd_edit.setFocus()
             self._cooldown.start(delay * 1000)
             return
-        if self._edit_mode:
-            value = self._new_edit.text()
-            if not 4 <= len(value) <= 128:
-                self.error.setText("密码须为 4–128 个字符")
-                return
-            if value != self._confirm_edit.text():
-                self.error.setText("两次新密码不一致")
-                return
+        if isinstance(result, str):
+            self.error.setText(result)
+            return
+        if isinstance(result, dict):
             try:
-                self.settings.set_password(value)
+                self.settings.update(result)
             except OSError:
                 self.error.setText("保存失败，请检查软件目录是否可写")
                 return
         self.accept()
+
+    def reject(self):
+        if self._task is None:
+            super().reject()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

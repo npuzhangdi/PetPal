@@ -66,18 +66,22 @@ def prepare_runtime(root, ico):
     for dll in base.glob("*.dll"):
         shutil.copy2(dll, scripts / dll.name)
     stamp_exe(pending, ico)
-    os.replace(pending, target)
-    return target
+    prepare_desktop_executable(target, root, source=pending)
+    pending.unlink()
 
 
-def build(root):
+def build(root, *, uninstaller_only=False):
     require_desktop_installer()
-    ensure_not_running(root)
+    if not uninstaller_only:
+        ensure_not_running(root)
     ico = root / "assets" / "petpal.ico"
     csc = find_csc()
     staging = root / "cache" / "build"
     staging.mkdir(parents=True, exist_ok=True)
-    for source, filename in (("launcher.cs", "PetPal.exe"), ("uninstaller.cs", "uninstall.exe")):
+    launchers = [("uninstaller.cs", "uninstall.exe")]
+    if not uninstaller_only:
+        launchers.insert(0, ("launcher.cs", "PetPal.exe"))
+    for source, filename in launchers:
         output = staging / filename
         result = subprocess.run([str(csc), "/nologo", "/target:winexe", "/platform:anycpu",
             "/optimize+", "/debug-", "/codepage:65001", "/win32icon:" + str(ico),
@@ -88,11 +92,12 @@ def build(root):
         stamp_exe(output, ico)
         if output.stat().st_size >= 1_000_000:
             raise RuntimeError(filename + " 启动器超过 1 MB")
-    runtime = prepare_runtime(root, ico)
-    prepare_desktop_executable(runtime, root)
-    for filename in ("PetPal.exe", "uninstall.exe"):
-        os.replace(staging / filename, root / filename)
-        prepare_desktop_executable(root / filename, root)
+    if not uninstaller_only:
+        prepare_runtime(root, ico)
+    for _, filename in launchers:
+        output = staging / filename
+        prepare_desktop_executable(root / filename, root, source=output)
+        output.unlink()
         print("  已生成 %s (%d 字节)" % (filename, (root / filename).stat().st_size), flush=True)
 
 
@@ -101,9 +106,10 @@ if __name__ == "__main__":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument("--uninstaller-only", action="store_true")
     args = parser.parse_args()
     try:
-        build(args.root.resolve())
+        build(args.root.resolve(), uninstaller_only=args.uninstaller_only)
     except Exception as exc:
         print("构建失败：" + str(exc), file=sys.stderr)
         sys.exit(1)
